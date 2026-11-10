@@ -1,0 +1,600 @@
+/**
+ * 一个 ACP prompt 回合的状态机：session/update → DSH StreamChunk 映射、
+ * 回合边界判定、工具 park 聚合与 finish 产出（原创实现）。
+ *
+ * 回合边界（本包的原创判定，ACP 规范未规定 DSH 侧的切分点）：
+ * 1. `session/prompt` 应答回来（stopReason）；
+ * 2. 桥上出现 park 的 MCP `tools/call`，且在 `parkSettleMs` 内没有新的
+ *    park（用于把同一 agent 批次里并发发出的多个调用收进同一轮）；
+ * 3. 调用方 abort；或回合内出现失败（权限被拒 / 非预期原生活动）。
+ * 先到者触发 `finishRound`，幂等。
+ *
+ * 关键性质：**finish 之后队列不再追加任何 chunk**，因此 `nextChunk()` 返回
+ * undefined 时消费者已经拿全了本轮的全部内容（含 usage 与最后的 finish）。
+ */
+import { ToolCallId } from '@deepseek-ai/dsh-llm'
+import type { LlmFailure, StreamChunk, TokenUsage } from '@deepseek-ai/dsh-llm'
+import type {
+  ConfigOptionUpdate,
+  ContentBlock,
+  PromptResponse,
+  RequestPermissionRequest,
+  RequestPermissionResponse,
+  SessionConfigOption,
+  SessionNotification,
+  SessionUpdate,
+  StopReason,
+  Usage,
+} from '@agentclientprotocol/sdk'
+import type { AgentLink } from '../protocol/agent-link.js'
+import type { BridgeParkedCall, BridgeToolResult, McpToolBridge } from '../bridge/mcp-bridge.js'
+import { BRIDGE_MCP_SERVER_NAME } from '../bridge/mcp-bridge.js'
+import { describePermissionRequest } from './permission-diagnostic.js'
+import { parsePermissionHandoff } from './permission-handoff.js'
+import type { PermissionDiagnostic } from './permission-diagnostic.js'
+import { inspectToolArguments, normalizeToolArguments, safeKeyNames } from './tool-args.js'
+
+/** 本文件使用的原创错误码（AGY_* 体系，与 agent-link / mcp-bridge 同族）。 */
+export const AGY_TURN_ERROR = {
+  /** ACP 工具权限请求被拒，不能据此判断请求一定是原生能力。 */
+  PERMISSION_DENIED: 'AGY_PERMISSION_DENIED',
+  /** agent 发起了 clientCapabilities 已关闭的原生能力请求（fs/terminal/…）。 */
+  NATIVE_ACTIVITY_REFUSED: 'AGY_NATIVE_ACTIVITY_REFUSED',
+  /** 调用方 abort 导致的回合终止。 */
+  ABORTED: 'AGY_ABORTED',
+  /** agent 以 refusal 结束本轮。 */
+  REFUSED: 'AGY_AGENT_REFUSED',
+  /** 本回合没有等待回喂的 park 调用，却收到了续轮回喂请求。 */
+  NO_PENDING_TOOL_CALL: 'AGY_NO_PENDING_TOOL_CALL',
+  /** 官方宣告 end_turn，但没有可见文本/工具调用；不能冒充成功。 */
+  EMPTY_RESPONSE: 'AGY_EMPTY_RESPONSE',
+} as const
+
+/** 未分类的意外状态（link 关闭、agent 异常取消等）在此码下归一。 */
+export const AGY_TURN_UNEXPECTED = 'AGY_UNEXPECTED'
+
+type FinishChunk = Extract<StreamChunk, { type: 'finish' }>
+
+type OpenBlock = {
+  index: number
+  blockType: 'text' | 'reasoning'
+  messageId: string | undefined
+  parts: string[]
+}
+
+/** ACP prompt 的 content 形状（与 SDK `PromptRequest.prompt` 对齐）。 */
+export type PromptContent = ContentBlock[]
+
+export interface PromptTurnOptions {
+  /** 已握手已认证的 ACP 链接。 */
+  link: AgentLink
+  /** 本回合使用的 MCP 工具桥。 */
+  bridge: McpToolBridge
+  /** session/prompt 的等待上限（毫秒）。 */
+  promptTimeoutMs: number
+  /** 并发 park 的聚合窗口（毫秒）。 */
+  parkSettleMs: number
+  /** config_option_update 的观察者（用于刷新模型目录）。 */
+  onConfigOptions?(options: readonly SessionConfigOption[]): void
+  /**
+   * 未自然结束的回合失败/取消：由 adapter 回收受管运行时，不依赖对端实现取消。
+   * `info.clean === true` 表示 prompt 已**正常应答**的干净失败（refusal / 空回复 /
+   * 未知 stopReason）：agent 状态自洽，调用方可以复用链接而不必回收。
+   */
+  onTerminate(reason: string, info?: { clean?: boolean; aborted?: boolean }): void
+  /** prompt 已应答（含取消应答）时回调；adapter 用它确认「取消是否真的生效」。 */
+  onPromptSettled?(turn: PromptTurn, response?: PromptResponse): void
+  /** 尚未终止回合的一次拒绝；permission 不等于原生 fs/terminal，不能据此做身份判断。 */
+  onNativeRefusal?(info: { kind: 'permission' | 'request'; detail: string; count: number }): void
+  /** 固定词表的权限结构摘要；仅诊断，不作为放行依据。 */
+  onPermissionDiagnostic?(diagnostic: PermissionDiagnostic): void
+  /** 仅允许私有 MCP 请求进入桥；不代表 DSH 已批准执行。 */
+  onBridgePermission?(tool: string): void
+  /**
+   * MCP 权限提示中的参数与目录 schema 不符（缺必填 / 出现未声明键）。仅诊断：
+   * 实际入桥时再修正别名与预检，DSH 负责最终校验；这里只含可安全回显的键名。
+   */
+  onArgumentIssues?(info: { tool: string; missing: string[]; unknown: string[]; unknownCount: number }): void
+}
+
+export class PromptTurn {
+  /** ACP 会话 id。 */
+  readonly sessionId: string
+  readonly #link: AgentLink
+  readonly #bridge: McpToolBridge
+  readonly #promptTimeoutMs: number
+  readonly #parkSettleMs: number
+  readonly #queue: StreamChunk[] = []
+  #waiters: Array<() => void> = []
+  readonly #parked: BridgeParkedCall[] = []
+  #settledWaiters: Array<() => void> = []
+  #onConfigOptions: ((options: readonly SessionConfigOption[]) => void) | undefined
+  /** 本回合内被拒绝的原生能力索要次数，仅用于诊断。 */
+  #nativeRefusals = 0
+  #onNativeRefusal: PromptTurnOptions['onNativeRefusal']
+  readonly #onPermissionDiagnostic: PromptTurnOptions['onPermissionDiagnostic']
+  #nextIndex = 0
+  #open: OpenBlock | undefined
+  #producerDone = false
+  #roundEnded = false
+  #promptSettled = false
+  #promptStarted = false
+  #failure: LlmFailure | undefined
+  #aborted = false
+  #truncated = false
+  #parkTimer: ReturnType<typeof setTimeout> | undefined
+  #abortCleanup: (() => void) | undefined
+  #terminated = false
+  #hasOutput = false
+  readonly #permissionIds = new Set<string>()
+  readonly #onBridgePermission: PromptTurnOptions['onBridgePermission']
+  readonly #onArgumentIssues: PromptTurnOptions['onArgumentIssues']
+  readonly #onTerminate: PromptTurnOptions['onTerminate']
+  readonly #onPromptSettled: PromptTurnOptions['onPromptSettled']
+  /** 本轮封口不等于 ACP prompt 结束；封口后的事件留给下一次 stream 消费。 */
+  #deferred: Array<{ kind: 'call'; call: BridgeParkedCall } | { kind: 'update'; update: SessionUpdate }> = []
+
+  constructor(sessionId: string, options: PromptTurnOptions) {
+    this.sessionId = sessionId
+    this.#link = options.link
+    this.#bridge = options.bridge
+    this.#promptTimeoutMs = options.promptTimeoutMs
+    this.#parkSettleMs = options.parkSettleMs
+    this.#onConfigOptions = options.onConfigOptions
+    this.#onNativeRefusal = options.onNativeRefusal
+    this.#onPermissionDiagnostic = options.onPermissionDiagnostic
+    this.#onTerminate = options.onTerminate
+    this.#onPromptSettled = options.onPromptSettled
+    this.#onBridgePermission = options.onBridgePermission
+    this.#onArgumentIssues = options.onArgumentIssues
+  }
+
+  /** 本回合的 ACP prompt 是否已有应答；应答后无法再「在同一 prompt 内续轮」。 */
+  get promptSettled(): boolean {
+    return this.#promptSettled
+  }
+
+  get promptStarted(): boolean { return this.#promptStarted }
+
+  /** 本地已终止，不再允许续接；对端回收由 adapter 的屏障保证。 */
+  get terminated(): boolean {
+    return this.#terminated
+  }
+
+  /** 本回合已交给 DSH 的工具调用（迟到调用在 resume 后才加入）。 */
+  get parkedCalls(): readonly BridgeParkedCall[] {
+    return this.#parked
+  }
+
+  /** 本回合是否停在「等待 DSH 回喂工具结果」的续轮状态。 */
+  get awaitingToolResults(): boolean {
+    return !this.#terminated && this.#roundEnded && this.#parked.some((call) => this.#bridge.hasPending(call.callId))
+  }
+
+  /** 把 session/update 交给当前回合（由 adapter 的稳定 handler 转发）。 */
+  handleSessionUpdate(notification: SessionNotification): void {
+    if (notification.sessionId !== this.sessionId || this.#terminated || this.#promptSettled) return
+    if (this.#roundEnded) {
+      this.#deferred.push({ kind: 'update', update: notification.update })
+      return
+    }
+    this.#applyUpdate(notification.update)
+  }
+
+  /**
+   * 仅私有 MCP 路由选择 allow_once，让实际 tools/call 在桥上 park；
+   * 不从权限提示合成第二次工具执行，不在这里封口或回收进程。
+   * 前提是 session/new 已移除 AGY 内置工具，且客户端 fs/terminal 已关闭。
+   * eager 工具按官方固定标题匹配目录；allow_always 从不选择。
+   */
+  handleRequestPermission(request: RequestPermissionRequest): RequestPermissionResponse {
+    // 迟到/外来会话的请求不能消耗当前回合的拒绝预算，也不能获准继续。
+    if (request.sessionId !== this.sessionId || this.#terminated || this.#promptSettled) {
+      this.#reportPermissionDiagnostic(request)
+      return { outcome: { outcome: 'cancelled' } }
+    }
+    const rejection = request.options.find((option) => option.kind === 'reject_once')
+      ?? request.options.find((option) => option.kind === 'reject_always')
+    const handoff = parsePermissionHandoff(request, {
+      sessionId: this.sessionId, serverName: BRIDGE_MCP_SERVER_NAME, tools: this.#bridge.toolSchemas(),
+    })
+    const allowance = request.options.find((option) => option.kind === 'allow_once')
+    if (handoff && allowance) {
+      if (this.#permissionIds.has(request.toolCall.toolCallId)) return { outcome: { outcome: 'cancelled' } }
+      this.#permissionIds.add(request.toolCall.toolCallId)
+      this.#reportArgumentIssues(handoff)
+      this.#onBridgePermission?.(handoff.name)
+      return { outcome: { outcome: 'selected', optionId: allowance.optionId } }
+    }
+    this.#reportPermissionDiagnostic(request)
+    // 调用 id 同样是不可信字符串，不进入日志或错误正文。
+    this.#recordNativeRefusal('permission', 'session/request_permission')
+    return rejection
+      ? { outcome: { outcome: 'selected', optionId: rejection.optionId } }
+      : { outcome: { outcome: 'cancelled' } }
+  }
+
+  #reportPermissionDiagnostic(request: RequestPermissionRequest): void {
+    this.#onPermissionDiagnostic?.(describePermissionRequest(request, {
+      sessionId: this.sessionId,
+      serverName: BRIDGE_MCP_SERVER_NAME,
+      toolNames: this.#bridge.toolNames(),
+    }))
+  }
+
+  /** 对照当前目录 schema 预检转交调用的参数键（只诊断，不改写、不拦截）。 */
+  #reportArgumentIssues(handoff: { name: string; arguments: string }): void {
+    if (!this.#onArgumentIssues) return
+    const tool = this.#bridge.toolSchemas().find((item) => item.name === handoff.name)
+    if (!tool) return
+    let args: unknown
+    try {
+      args = JSON.parse(handoff.arguments)
+    } catch {
+      return
+    }
+    const { missing, unknown } = inspectToolArguments(tool, normalizeToolArguments(tool, args).arguments)
+    if (missing.length === 0 && unknown.length === 0) return
+    this.#onArgumentIssues({
+      tool: tool.name,
+      missing: safeKeyNames(missing),
+      unknown: safeKeyNames(unknown),
+      unknownCount: unknown.length,
+    })
+  }
+
+  /**
+   * clientCapabilities 已全部关闭，因此这里出现的任何 agent→client 请求都是非预期的。
+   * 与权限询问同样处理：响应照旧由 AgentLink 回 method-not-found，本回合先继续。
+   */
+  handleUnexpectedAgentRequest(method: string): void {
+    this.#recordNativeRefusal('request', method)
+  }
+
+  /** 操作照常拒绝并记录，不把拒绝次数升级为整个对话失败。 */
+  #recordNativeRefusal(kind: 'permission' | 'request', detail: string): void {
+    this.#nativeRefusals += 1
+    this.#onNativeRefusal?.({ kind, detail, count: this.#nativeRefusals })
+  }
+
+  /**
+   * 启动 session/prompt 并驱动回合收尾（不阻塞调用方）。
+   * 调用时信号已 aborted 的请求根本不发出 prompt：无人应答的回合没有价值，
+   * 也不该在 ACP 侧留下一次无人接收的 prompt。
+   */
+  startPrompt(content: PromptContent, signal?: AbortSignal): void {
+    if (signal?.aborted) {
+      this.#aborted = true
+      this.#fail({ code: AGY_TURN_ERROR.ABORTED, message: `Antigravity ACP 回合在发起前即被调用方中止：${String(signal.reason ?? 'aborted')}` })
+      return
+    }
+    this.#promptStarted = true
+    const prompt = this.#link.prompt({ sessionId: this.sessionId, prompt: content }, { timeoutMs: this.#promptTimeoutMs })
+    void this.#drive(prompt)
+    if (signal) this.#attachAbort(signal)
+  }
+
+  /** 收到 abort 信号：取消 ACP 会话当前回合并以 aborted 结束。 */
+  abort(reason: string): void {
+    if (this.#terminated || this.#promptSettled) return
+    this.#aborted = true
+    this.#fail({ code: AGY_TURN_ERROR.ABORTED, message: `Antigravity ACP 回合被调用方中止：${reason}` })
+  }
+
+  /** 桥 park 了新调用：进入当前回合。 */
+  handleParked(call: BridgeParkedCall): void {
+    if (this.#terminated) return
+    if (this.#roundEnded) {
+      this.#deferred.push({ kind: 'call', call })
+      return
+    }
+    this.#parked.push(call)
+    this.#emitToolCallBlock(call)
+    // 重置聚合窗口，让同一批次里随后到达的并发调用并入同一轮。
+    if (this.#parkTimer) clearTimeout(this.#parkTimer)
+    const timer = setTimeout(() => {
+      this.#parkTimer = undefined
+      this.finishRound()
+    }, this.#parkSettleMs)
+    timer.unref?.()
+    this.#parkTimer = timer
+  }
+
+  /**
+   * 续轮复位：上一轮以 finish(tool-calls) 封口后，生产者已停摆。续轮要继续
+   * 在**同一个 ACP prompt** 内接收后续 session/update，因此重新打开队列与
+   * 回合边界，并（若给了 signal）重新挂上 abort 监听。
+   *
+   * 上一轮已产出的 chunk（含 finish）不会重放——续轮只交付新内容。
+   */
+  resume(signal?: AbortSignal): void {
+    this.#queue.length = 0
+    this.#producerDone = false
+    this.#roundEnded = false
+    this.#failure = undefined
+    this.#aborted = false
+    this.#truncated = false
+    this.#abortCleanup?.()
+    this.#abortCleanup = undefined
+    if (signal) this.#attachAbort(signal)
+    const deferred = this.#deferred
+    this.#deferred = []
+    for (const event of deferred) {
+      if (this.#terminated) break
+      if (event.kind === 'call') this.handleParked(event.call)
+      else this.#applyUpdate(event.update)
+    }
+  }
+
+  /** 续轮回喂：把 DSH 的 tool result 交给桥 resolve 对应的 MCP 调用。 */
+  async deliverToolResults(results: readonly BridgeToolResult[]): Promise<void> {
+    for (const result of results) {
+      if (!this.#bridge.hasPending(result.callId)) {
+        throw new Error(`${AGY_TURN_ERROR.NO_PENDING_TOOL_CALL}: 本回合没有等待回喂的工具调用 ${result.callId}`)
+      }
+    }
+    await this.#bridge.deliverResults(results)
+  }
+
+  /** 消费者侧：取下一个 chunk；undefined 表示本轮（含 finish）已取尽。 */
+  async nextChunk(): Promise<StreamChunk | undefined> {
+    for (;;) {
+      const chunk = this.#queue.shift()
+      if (chunk !== undefined) return chunk
+      if (this.#producerDone) return undefined
+      await new Promise<void>((resolve) => this.#waiters.push(resolve))
+    }
+  }
+
+  /** 等待 ACP prompt 应答（测试与诊断使用）。 */
+  async settled(): Promise<void> {
+    if (this.#promptSettled) return
+    await new Promise<void>((resolve) => this.#settledWaiters.push(resolve))
+  }
+
+  /** 释放定时器与 abort 监听（回合结束或回合被放弃时调用）。 */
+  dispose(): void {
+    if (this.#parkTimer) {
+      clearTimeout(this.#parkTimer)
+      this.#parkTimer = undefined
+    }
+    this.#abortCleanup?.()
+    this.#abortCleanup = undefined
+  }
+
+  async #drive(prompt: Promise<PromptResponse>): Promise<void> {
+    try {
+      const response = await prompt
+      this.#markPromptSettled(response)
+      this.#finishWith(response)
+    } catch (error) {
+      this.#markPromptSettled()
+      this.#fail({
+        code: readErrorCode(error),
+        message: error instanceof Error ? error.message : String(error),
+      })
+    }
+  }
+
+  #markPromptSettled(response?: PromptResponse): void {
+    this.#promptSettled = true
+    this.dispose()
+    const waiters = this.#settledWaiters
+    this.#settledWaiters = []
+    for (const resolve of waiters) resolve()
+    this.#onPromptSettled?.(this, response)
+  }
+
+  #finishWith(response: PromptResponse): void {
+    const reason = this.#mapStopReason(response.stopReason)
+    if (reason) {
+      // stopReason 已随响应到达（refusal / cancelled / 未知）：prompt 正常应答，
+      // 属于干净失败，链接可复用。
+      this.#fail(reason, true)
+      return
+    }
+    if (response.stopReason === 'end_turn' && !this.#hasOutput) {
+      // end_turn 已应答，只是没有可见产出：同样是干净失败。
+      this.#fail({
+        code: AGY_TURN_ERROR.EMPTY_RESPONSE,
+        message: 'Antigravity ACP 已结束回合，但没有返回可见文本或工具调用；本次不是成功回复',
+      }, true)
+      return
+    }
+    this.finishRound(mapUsage(response.usage))
+  }
+
+  #mapStopReason(stopReason: StopReason): LlmFailure | undefined {
+    if (this.#failure) return this.#failure
+    switch (stopReason) {
+      case 'end_turn':
+        return undefined
+      case 'refusal':
+        return { code: AGY_TURN_ERROR.REFUSED, message: 'Antigravity ACP agent 拒绝了本轮请求（stopReason=refusal）' }
+      case 'cancelled':
+        return { code: AGY_TURN_UNEXPECTED, message: 'Antigravity ACP agent 在未收到调用方 abort 的情况下取消了本轮（stopReason=cancelled）' }
+      case 'max_tokens':
+      case 'max_turn_requests':
+        // 截断类 stop 在 StreamChunk 词表里有专门 kind，不算失败。
+        this.#truncated = true
+        return undefined
+      default:
+        return { code: AGY_TURN_UNEXPECTED, message: `Antigravity ACP 返回未知的 stopReason: ${String(stopReason)}` }
+    }
+  }
+
+  /**
+   * 结束本回合并以失败封口。`clean = true` 仅在 prompt 已正常应答的失败
+   * （refusal / 空回复 / 未知 stopReason）时传入：此时 agent 状态自洽，
+   * onTerminate 会带 `info.clean`，调用方可复用链接而不必回收。
+   */
+  #fail(failure: LlmFailure, clean = false): void {
+    if (this.#failure) return
+    this.#failure = failure
+    this.finishRound()
+    this.dispose()
+    this.#deferred = []
+    // 协作式 cancel 仅尽力发送；不能把本地 finish 当成对端已停止的证明。
+    // 即使 prompt 已超时/拒绝，仍回收连接，避免复用残留执行状态。
+    this.#terminated = true
+    if (!this.#promptSettled) void this.#link.cancel(this.sessionId).catch(() => undefined)
+    this.#onTerminate(failure.message, {
+      ...(clean ? { clean: true } : {}),
+      ...(this.#aborted ? { aborted: true } : {}),
+    })
+  }
+
+  /**
+   * 结束本回合并向队列封口：先 usage 后 finish；finish 入队后生产者停止，
+   * 因此消费者不会看到 finish 之后的任何 chunk。幂等。
+   */
+  finishRound(usage?: TokenUsage): void {
+    if (this.#roundEnded) return
+    this.#roundEnded = true
+    this.closeOpenBlock()
+    if (usage) this.#push({ type: 'usage', usage })
+    this.#push({ type: 'finish', reason: this.#resolveFinish() })
+    this.#producerDone = true
+    this.#wake()
+    if (this.#parkTimer) clearTimeout(this.#parkTimer)
+    this.#parkTimer = undefined
+    // 工具执行期间仍需响应取消；只在 ACP prompt 真正结束时移除 abort 监听。
+    if (this.#promptSettled) this.dispose()
+  }
+
+  #resolveFinish(): FinishChunk['reason'] {
+    if (this.#failure) {
+      return this.#aborted
+        ? { kind: 'aborted', failure: this.#failure }
+        : { kind: 'error', failure: this.#failure }
+    }
+    // 只在**仍有未回喂的 park** 时才是 tool-calls：续轮把结果交付后，同一批
+    // park 已经结算，本轮的结束原因回到 stop/max-tokens。
+    if (this.#parked.some((call) => this.#bridge.hasPending(call.callId))) return { kind: 'tool-calls' }
+    if (this.#truncated) return { kind: 'max-tokens' }
+    return { kind: 'stop' }
+  }
+
+  #applyUpdate(update: SessionUpdate): void {
+    switch (update.sessionUpdate) {
+      case 'agent_message_chunk':
+        this.#appendText('text', update.messageId ?? undefined, update.content)
+        return
+      case 'agent_thought_chunk':
+        this.#appendText('reasoning', update.messageId ?? undefined, update.content)
+        return
+      case 'config_option_update': {
+        const configUpdate: ConfigOptionUpdate = update
+        this.#onConfigOptions?.(configUpdate.configOptions)
+        return
+      }
+      default:
+        // 其余 update（plan / tool_call / usage_update / mode / compaction …）
+        // 是进度或遥测信息，DSH StreamChunk 词表无对应表达；内容只存在于上面
+        // 两个 *_chunk 分支，因此这里丢弃的只有进度信息。
+        return
+    }
+  }
+
+  #appendText(blockType: 'text' | 'reasoning', messageId: string | undefined, content: unknown): void {
+    if (content && typeof content === 'object' && 'type' in content && content.type !== 'text') {
+      this.#fail({ code: 'AGY_UNSUPPORTED_CONTENT', message: 'ACP 返回了当前 DSH 输出通道尚不能保存的非文本内容，未将二进制数据作为文字显示' })
+      return
+    }
+    const text = renderContentText(content)
+    if (text === undefined) return
+    if (blockType === 'text' && text.trim().length > 0) this.#hasOutput = true
+    if (this.#open && (this.#open.blockType !== blockType || this.#open.messageId !== messageId)) {
+      this.closeOpenBlock()
+    }
+    if (!this.#open) {
+      this.#open = { index: this.#nextIndex++, blockType, messageId, parts: [] }
+      this.#push({ type: 'block-start', index: this.#open.index, blockType })
+    }
+    this.#open.parts.push(text)
+    this.#push(blockType === 'text'
+      ? { type: 'text-delta', index: this.#open.index, text }
+      : { type: 'reasoning-delta', index: this.#open.index, text })
+  }
+
+  #emitToolCallBlock(call: BridgeParkedCall): void {
+    this.#hasOutput = true
+    this.closeOpenBlock()
+    const index = this.#nextIndex++
+    this.#push({ type: 'block-start', index, blockType: 'tool-call' })
+    this.#push({
+      type: 'block-end',
+      index,
+      block: { type: 'tool-call', id: ToolCallId(call.callId), name: call.name, arguments: call.arguments },
+    })
+  }
+
+  /** 关闭当前打开中的 text/reasoning block（幂等）。 */
+  closeOpenBlock(): void {
+    const open = this.#open
+    if (!open) return
+    this.#open = undefined
+    this.#push({ type: 'block-end', index: open.index, block: { type: open.blockType, text: open.parts.join('') } })
+  }
+
+  #push(chunk: StreamChunk): void {
+    if (this.#producerDone) return
+    this.#queue.push(chunk)
+    this.#wake()
+  }
+
+  #wake(): void {
+    // 必须整体换新数组：若只清空长度，捕获的局部变量与字段是同一个对象，
+    // 后面的 for…of 会遍历到空数组，等待者永远不会被唤醒。
+    const waiters = this.#waiters
+    this.#waiters = []
+    for (const resolve of waiters) resolve()
+  }
+
+  #attachAbort(signal: AbortSignal): void {
+    if (signal.aborted) {
+      this.abort(String(signal.reason ?? 'aborted'))
+      return
+    }
+    const onAbort = (): void => this.abort(String(signal.reason ?? 'aborted'))
+    signal.addEventListener('abort', onAbort, { once: true })
+    this.#abortCleanup = () => signal.removeEventListener('abort', onAbort)
+  }
+}
+
+function readErrorCode(error: unknown): string {
+  if (error && typeof error === 'object' && 'code' in error && typeof error.code === 'string') return error.code
+  return AGY_TURN_UNEXPECTED
+}
+
+/**
+ * 把一个 ACP ContentBlock 渲染为纯文本。
+ * 输入图像通过附件服务传递；输出当前只有文本通道，非文本输出由调用方明确拒绝。
+ */
+function renderContentText(content: unknown): string | undefined {
+  if (typeof content === 'string') return content
+  if (content && typeof content === 'object' && 'type' in content) {
+    const block = content as { type: string; text?: unknown }
+    if (block.type === 'text' && typeof block.text === 'string') return block.text
+    return undefined
+  }
+  return undefined
+}
+
+/**
+ * ACP Usage → DSH TokenUsage。
+ *
+ * 协议把 `PromptResponse.usage` 标为「本轮用量」（UNSTABLE），但官方
+ * agy_acp_server 1.4.0 实测不返回该字段，因此本 adapter 通常不上报 usage；
+ * 返回时按原值上报，不做任何估算或累计换算。
+ */
+export function mapUsage(usage: Usage | null | undefined): TokenUsage | undefined {
+  if (!usage) return undefined
+  let mapped: TokenUsage = { inputTokens: usage.inputTokens, outputTokens: usage.outputTokens }
+  if (usage.totalTokens !== undefined) mapped = { ...mapped, totalTokens: usage.totalTokens }
+  if (usage.cachedReadTokens != null) mapped = { ...mapped, cacheReadTokens: usage.cachedReadTokens }
+  if (usage.cachedWriteTokens != null) mapped = { ...mapped, cacheWriteTokens: usage.cachedWriteTokens }
+  if (usage.thoughtTokens != null) mapped = { ...mapped, reasoningTokens: usage.thoughtTokens }
+  return mapped
+}
+

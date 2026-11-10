@@ -1,0 +1,8 @@
+node_modules/
+.local-install/
+.local-preview/
+*.tsbuildinfo
+*.log
+*.tgz
+
+# dist/ 故意纳入版本库：仓库同时发布 0.1.37 构建产物，便于直接与 npm 包逐字节比对。
